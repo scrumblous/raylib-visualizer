@@ -124,7 +124,6 @@ fn main() {
         .log_level(TraceLogLevel::LOG_ERROR)
         .undecorated()
         .build();
-    rl.set_target_fps(165);
     let cat_icon = include_bytes!("cat.png");
     rl.set_window_icon(Image::load_image_from_mem(".png", cat_icon).unwrap());
 
@@ -167,6 +166,11 @@ fn main() {
         frame_counter += 1;
         if frame_counter > 10000 {
             frame_counter = 0;
+        }
+        if frame_counter % 100 == 0 {
+            let current_monitor = get_current_monitor();
+            let target_fps = get_monitor_refresh_rate(current_monitor);
+            rl.set_target_fps((target_fps as f32 * 0.9) as u32);
         }
         let ffi_enabled_clone_2 = ffi_enabled.clone();
         if let Ok(guard) = ffi_enabled_clone_2.try_lock() {
