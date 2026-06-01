@@ -8,6 +8,9 @@ use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::StructuredStorage::{PropVariantToString, PROPVARIANT};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ};
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+pub const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+pub const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 
 pub fn start_desktop_audio_capture(buffer: SharedBuffer, ffi_enabled: Arc<Mutex<bool>>) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
@@ -15,7 +18,8 @@ pub fn start_desktop_audio_capture(buffer: SharedBuffer, ffi_enabled: Arc<Mutex<
         let mut planner = FftPlanner::new();
         CoInitializeEx(None, COINIT_MULTITHREADED)?;
 
-        let devname_pkey = PROPERTYKEY {fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0), pid: 14};
+        let devname_pkey = PROPERTYKEY {fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0), pid: 14}; 
+        // ^devices pkey, since i couldn't find it in the crate
 
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).unwrap_or_else(|_| {
@@ -27,7 +31,8 @@ pub fn start_desktop_audio_capture(buffer: SharedBuffer, ffi_enabled: Arc<Mutex<
         let propvar_pntr = &mut device_pvar_name as *mut PROPVARIANT;
         let mut name_buffer: [u16; 256] = [0; 256];
         PropVariantToString(propvar_pntr, &mut name_buffer)?;
-        let dev_name = String::from_utf16(
+        let dev_name = String::from_utf16
+        (
             &name_buffer[..name_buffer.iter()
             .position(|&x| x == 0)
             .unwrap_or(name_buffer.len())
@@ -35,6 +40,7 @@ pub fn start_desktop_audio_capture(buffer: SharedBuffer, ffi_enabled: Arc<Mutex<
         )?;
 
         let collection = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        println!("available devices:");
         for i in 0..collection.GetCount()? {
             let item = collection.Item(i)?;
             let mut pvar = item.OpenPropertyStore(STGM_READ)?.GetValue(&devname_pkey)?;
@@ -60,6 +66,16 @@ pub fn start_desktop_audio_capture(buffer: SharedBuffer, ffi_enabled: Arc<Mutex<
             closest_match
         } else {
             wave_format
+        };
+
+        let format_tag = (*final_format).wFormatTag;
+        let bits = (*final_format).wBitsPerSample;
+        let is_float = if format_tag == WAVE_FORMAT_EXTENSIBLE as u16 {
+            let ext = final_format as *const WAVEFORMATEXTENSIBLE;
+            let sub_format = std::ptr::read_unaligned(std::ptr::addr_of!((*ext).SubFormat));
+            sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        } else {
+            format_tag == WAVE_FORMAT_IEEE_FLOAT as u16
         };
 
 
@@ -102,14 +118,12 @@ pub fn start_desktop_audio_capture(buffer: SharedBuffer, ffi_enabled: Arc<Mutex<
                 if num_frames > 0 && !data_ptr.is_null() {
                     let channels = (*wave_format).nChannels as usize;
                     let sample_count = (num_frames as usize) * channels;
-                    let samples = std::slice::from_raw_parts(data_ptr as *const f32, sample_count);
-                    if channels == 2 {
-                        for chunk in samples.chunks_exact(2) {
-                            let mono = (chunk[0] + chunk[1]) / 2.0;
-                            accumulation_buffer.push(mono);
-                        }
-                    } else {
-                        accumulation_buffer.extend_from_slice(samples);
+                    //let samples = std::slice::from_raw_parts(data_ptr as *const f32, sample_count);
+                    let converted = samples_to_f32(data_ptr as *const u8, sample_count, bits, is_float);
+                    let channels = (*final_format).nChannels as usize;
+                    for chunk in converted.chunks_exact(channels) {
+                        let mono = chunk.iter().sum::<f32>() / channels as f32;
+                        accumulation_buffer.push(mono);
                     }
 
                     if let Ok(mut buffer_guard) = buffer.try_lock() {
@@ -142,6 +156,34 @@ pub fn start_desktop_audio_capture(buffer: SharedBuffer, ffi_enabled: Arc<Mutex<
 
                 capture_client.ReleaseBuffer(num_frames)?;
             }
+        }
+    }
+}
+
+fn samples_to_f32(data: *const u8, count: usize, bits: u16, is_float: bool) -> Vec<f32> {
+    unsafe {
+        match (is_float, bits) {
+            (true, 32) => {
+                std::slice::from_raw_parts(data as *const f32, count).to_vec()
+            }
+            (false, 16) => {
+                std::slice::from_raw_parts(data as *const i16, count)
+                    .iter().map(|&s| s as f32 / 32768.0).collect()
+            }
+            (false, 32) => {
+                std::slice::from_raw_parts(data as *const i32, count)
+                    .iter().map(|&s| s as f32 / 2147483648.0).collect()
+            }
+            (false, 24) => {
+                // Packed 24-bit, 3 bytes per sample
+                (0..count).map(|i| {
+                    let b = &std::slice::from_raw_parts(data, count * 3)[i*3..i*3+3];
+                    let val = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+                    let val = if val & 0x800000 != 0 { val | !0xFFFFFF } else { val };
+                    val as f32 / 8388608.0
+                }).collect()
+            }
+            _ => vec![0.0; count] // unsupported format, silent fallback
         }
     }
 }
